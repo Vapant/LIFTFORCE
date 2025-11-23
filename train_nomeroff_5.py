@@ -3,28 +3,26 @@ import pytesseract
 import numpy as np
 import re
 import time
-from ultralytics import YOLO  # Библиотека, которую ты использовал для обучения
+from ultralytics import YOLO
 
 # ==========================================
 # НАСТРОЙКИ
 # ==========================================
 
-# 1. Путь к Tesseract
+# 1. Пути (Проверь их!)
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+MODEL_PATH = 'best.pt'  # Твой обученный файл
+VIDEO_SOURCE = r'test_video.mp4'
+# VIDEO_SOURCE = 0 # Для веб-камеры
 
-# 2. Путь к твоей обученной модели
-# В скрипте обучения она сохраняется в папке runs/detect/nomeroff_yolov8n/weights/best.pt
-# Скопируй best.pt в папку с этим скриптом или укажи полный путь
-MODEL_PATH = 'best.pt'
+# 2. Настройки оптимизации
+SKIP_FRAMES = 5  # Обрабатывать только каждый 5-й кадр
+MIN_PLATE_WIDTH = 60  # Игнорировать номера меньше 60px шириной
+COOLDOWN_SECONDS = 10  # Не отправлять один и тот же номер чаще чем раз в 10 сек
 
-# 3. Источник видео
-VIDEO_SOURCE = r'test_video_2.mp4'
-
-
-# VIDEO_SOURCE = 0  # Раскомментируй для веб-камеры
 
 # ==========================================
-# КЛАСС OCR (Остался без изменений)
+# КЛАСС OCR
 # ==========================================
 
 class LicensePlateOCR:
@@ -33,18 +31,24 @@ class LicensePlateOCR:
         self.config = f'--oem 3 --psm 7 -c tessedit_char_whitelist={self.whitelist}'
 
     def preprocess(self, img):
-        scale_percent = 200
-        width = int(img.shape[1] * scale_percent / 100)
-        height = int(img.shape[0] * scale_percent / 100)
-        dim = (width, height)
-        resized = cv2.resize(img, dim, interpolation=cv2.INTER_CUBIC)
+        # Увеличение
+        scale = 2
+        w = int(img.shape[1] * scale)
+        h = int(img.shape[0] * scale)
+        resized = cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+
+        # ЧБ + Размытие
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Бинаризация (получаем черно-белую маску)
         _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return binary
 
     def validate_text(self, text):
+        # Оставляем только допустимые символы
         clean = re.sub(r'[^ABEKMHOPCTYX0123456789]', '', text.upper())
+        # Простая проверка длины (РФ номера обычно 8-9 символов)
         if 6 <= len(clean) <= 9:
             return clean
         return None
@@ -61,115 +65,95 @@ class LicensePlateOCR:
 
 
 # ==========================================
-# ОСНОВНАЯ ЛОГИКА (Адаптировано под YOLOv8)
+# MAIN
 # ==========================================
 
 def main():
-    print(f"Загрузка модели из {MODEL_PATH}...")
+    print("Загрузка модели...")
     try:
-        # Загружаем модель YOLOv8
         model = YOLO(MODEL_PATH)
     except Exception as e:
-        print(f"Ошибка загрузки модели: {e}")
-        print("Убедитесь, что файл best.pt находится в папке или укажите правильный путь.")
+        print(f"Не найдена модель {MODEL_PATH}. Проверь путь.")
         return
 
     ocr = LicensePlateOCR()
-
     cap = cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        print("Ошибка: Невозможно открыть видео.")
-        return
 
-    cv2.namedWindow('Smart Checkpoint', cv2.WINDOW_NORMAL)
-
-    # ... (импорты и инициализация модели остаются те же) ...
-
-    # Словарь для защиты от повторных срабатываний: { "A123BC77": timestamp }
-    sent_plates = {}
-
-    # Буфер для "голосования" (упрощенный): собираем последние распознавания
-    # Чтобы считать номер подтвержденным
-    plate_buffer = []
+    # Словари для логики
+    sent_plates = {}  # {номер: время_последней_отправки}
 
     frame_count = 0
-    SKIP_FRAMES = 3  # Обрабатывать только каждый 5-й кадр (ускорение в 5 раз)
-    MIN_PLATE_WIDTH = 30  # Минимальная ширина номера в пикселях для OCR
-    COOLDOWN_SECONDS = 1  # Не отправлять один и тот же номер чаще чем раз в 15 сек
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Просто отображаем видео (без обработки) для плавности,
-        # если это пропускаемый кадр
         frame_count += 1
+
+        # ОПТИМИЗАЦИЯ 1: Пропускаем кадры для ускорения
+        # (показываем видео всегда, но нейросети запускаем редко)
         if frame_count % SKIP_FRAMES != 0:
             cv2.imshow('Smart Checkpoint', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-            continue  # Пропускаем тяжелую логику
+            continue
 
         start_time = time.time()
 
-        # --- 1. ДЕТЕКЦИЯ (YOLO) ---
+        # --- ДЕТЕКЦИЯ ---
         results = model(frame, stream=True, verbose=False, conf=0.4)
 
         for result in results:
             boxes = result.boxes
             for box in boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                conf = float(box.conf[0])
 
-                # Вычисляем ширину номера
-                plate_w = x2 - x1
-                plate_h = y2 - y1
-
-                # Рисуем рамку всегда, чтобы видеть, что YOLO работает
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # --- 2. ФИЛЬТР: Если номер слишком мелкий или слишком далеко ---
-                # Это экономит ресурсы, не запуская Tesseract на мусоре
-                if plate_w < MIN_PLATE_WIDTH:
+                # ОПТИМИЗАЦИЯ 2: Фильтр по размеру
+                width = x2 - x1
+                if width < MIN_PLATE_WIDTH:
                     continue
 
-                # --- 3. ПОДГОТОВКА К OCR ---
+                # Рисуем рамку на основном видео
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                # Вырезаем номер с отступом
                 pad = 5
                 h_img, w_img, _ = frame.shape
                 plate_roi = frame[max(0, y1 - pad):min(h_img, y2 + pad), max(0, x1 - pad):min(w_img, x2 + pad)]
 
-                # --- 4. ТЯЖЕЛАЯ ОПЕРАЦИЯ: OCR ---
-                # Запускаем только если прошли фильтры
-                text, _ = ocr.recognize(plate_roi)
+                if plate_roi.size == 0:
+                    continue
 
-                if text:
-                    current_time = time.time()
+                # --- РАСПОЗНАВАНИЕ ---
+                text, debug_img = ocr.recognize(plate_roi)
 
-                    # Визуализация
-                    label = f"{text}"
-                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    print(f"Вижу номер: {text}")
+                if debug_img is not None:
+                    # Чтобы нарисовать ЦВЕТНОЙ текст на ЧБ картинке, нужно перевести её обратно в BGR
+                    debug_color = cv2.cvtColor(debug_img, cv2.COLOR_GRAY2BGR)
 
-                    # --- 5. ЛОГИКА БИЗНЕС-ПРОЦЕССА (Защита сервера) ---
-                    # Проверяем, отправляли ли мы этот номер недавно
-                    last_sent = sent_plates.get(text, 0)
+                    if text:
+                        # Рисуем текст прямо на вырезанном номере (Debug окно)
+                        # Координаты (10, 30) - примерное место начала текста
+                        cv2.putText(debug_color, text, (10, debug_color.shape[0] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-                    if (current_time - last_sent) > COOLDOWN_SECONDS:
-                        # === ЗДЕСЬ КОД ОТПРАВКИ НА СЕРВЕР ===
-                        print(f">>> ЗАПРОС В БД: Открываем шлагбаум для {text} <<<")
-                        # requests.post(...)
+                        # Рисуем текст на основном окне
+                        cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-                        # Обновляем время последней отправки
-                        sent_plates[text] = current_time
-                    else:
-                        print(f"Дубликат. Игнорирую {text}")
+                        # ЛОГИКА БИЗНЕСА (Кулдаун)
+                        current_time = time.time()
+                        last_sent = sent_plates.get(text, 0)
+                        if (current_time - last_sent) > COOLDOWN_SECONDS:
+                            print(f">>> ОТКРЫТЬ ШЛАГБАУМ: {text} <<<")
+                            sent_plates[text] = current_time
 
-        # FPS будет реальным (с учетом пропусков)
-        fps = 1.0 / (time.time() - start_time) * SKIP_FRAMES
-        cv2.putText(frame, f"FPS (Logic): {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    # Показываем окно с вырезанным номером и нарисованным текстом
+                    cv2.imshow("Debug Plate", debug_color)
 
+        # Отображение
         cv2.imshow('Smart Checkpoint', frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
