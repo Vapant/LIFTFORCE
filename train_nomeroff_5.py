@@ -18,7 +18,7 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 MODEL_PATH = 'best.pt'
 
 # 3. Источник видео
-VIDEO_SOURCE = r'E:\Учёба\Языки программирования\LIFTFORCE\test_video.mp4'
+VIDEO_SOURCE = r'test_video_2.mp4'
 
 
 # VIDEO_SOURCE = 0  # Раскомментируй для веб-камеры
@@ -83,69 +83,93 @@ def main():
 
     cv2.namedWindow('Smart Checkpoint', cv2.WINDOW_NORMAL)
 
+    # ... (импорты и инициализация модели остаются те же) ...
+
+    # Словарь для защиты от повторных срабатываний: { "A123BC77": timestamp }
+    sent_plates = {}
+
+    # Буфер для "голосования" (упрощенный): собираем последние распознавания
+    # Чтобы считать номер подтвержденным
+    plate_buffer = []
+
+    frame_count = 0
+    SKIP_FRAMES = 3  # Обрабатывать только каждый 5-й кадр (ускорение в 5 раз)
+    MIN_PLATE_WIDTH = 30  # Минимальная ширина номера в пикселях для OCR
+    COOLDOWN_SECONDS = 1  # Не отправлять один и тот же номер чаще чем раз в 15 сек
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Просто отображаем видео (без обработки) для плавности,
+        # если это пропускаемый кадр
+        frame_count += 1
+        if frame_count % SKIP_FRAMES != 0:
+            cv2.imshow('Smart Checkpoint', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue  # Пропускаем тяжелую логику
+
         start_time = time.time()
 
-        # --- ДЕТЕКЦИЯ (YOLOv8) ---
-        # stream=True делает работу быстрее, возвращая генератор
+        # --- 1. ДЕТЕКЦИЯ (YOLO) ---
         results = model(frame, stream=True, verbose=False, conf=0.4)
 
-        # YOLOv8 возвращает список результатов (по кадрам), у нас 1 кадр
         for result in results:
-            boxes = result.boxes  # Получаем объект с рамками
-
+            boxes = result.boxes
             for box in boxes:
-                # Координаты (x1, y1, x2, y2)
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-
-                # Уверенность (confidence)
                 conf = float(box.conf[0])
 
-                # Класс (если у тебя 1 класс "license_plate", это будет 0)
-                cls = int(box.cls[0])
+                # Вычисляем ширину номера
+                plate_w = x2 - x1
+                plate_h = y2 - y1
 
-                # --- Вырезаем номер и распознаем ---
-                h, w, _ = frame.shape
-                pad = 5  # Отступ
-                y1_c = max(0, y1 - pad)
-                y2_c = min(h, y2 + pad)
-                x1_c = max(0, x1 - pad)
-                x2_c = min(w, x2 + pad)
+                # Рисуем рамку всегда, чтобы видеть, что YOLO работает
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                plate_roi = frame[y1_c:y2_c, x1_c:x2_c]
-
-                if plate_roi.size == 0:
+                # --- 2. ФИЛЬТР: Если номер слишком мелкий или слишком далеко ---
+                # Это экономит ресурсы, не запуская Tesseract на мусоре
+                if plate_w < MIN_PLATE_WIDTH:
                     continue
 
-                # OCR
-                text, debug_img = ocr.recognize(plate_roi)
+                # --- 3. ПОДГОТОВКА К OCR ---
+                pad = 5
+                h_img, w_img, _ = frame.shape
+                plate_roi = frame[max(0, y1 - pad):min(h_img, y2 + pad), max(0, x1 - pad):min(w_img, x2 + pad)]
 
-                # Рисуем
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                # --- 4. ТЯЖЕЛАЯ ОПЕРАЦИЯ: OCR ---
+                # Запускаем только если прошли фильтры
+                text, _ = ocr.recognize(plate_roi)
 
                 if text:
-                    label = f"{text} ({conf:.2f})"
-                    cv2.rectangle(frame, (x1, y1 - 30), (x1 + len(label) * 15, y1), color, -1)
-                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                    current_time = time.time()
 
-                    print(f"НОМЕР: {text}")
+                    # Визуализация
+                    label = f"{text}"
+                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    print(f"Вижу номер: {text}")
 
-                    if debug_img is not None:
-                        cv2.imshow(f"Debug OCR", debug_img)
-                else:
-                    cv2.putText(frame, "Detecting...", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    # --- 5. ЛОГИКА БИЗНЕС-ПРОЦЕССА (Защита сервера) ---
+                    # Проверяем, отправляли ли мы этот номер недавно
+                    last_sent = sent_plates.get(text, 0)
 
-        # FPS
-        fps = 1.0 / (time.time() - start_time)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    if (current_time - last_sent) > COOLDOWN_SECONDS:
+                        # === ЗДЕСЬ КОД ОТПРАВКИ НА СЕРВЕР ===
+                        print(f">>> ЗАПРОС В БД: Открываем шлагбаум для {text} <<<")
+                        # requests.post(...)
+
+                        # Обновляем время последней отправки
+                        sent_plates[text] = current_time
+                    else:
+                        print(f"Дубликат. Игнорирую {text}")
+
+        # FPS будет реальным (с учетом пропусков)
+        fps = 1.0 / (time.time() - start_time) * SKIP_FRAMES
+        cv2.putText(frame, f"FPS (Logic): {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
         cv2.imshow('Smart Checkpoint', frame)
-
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
