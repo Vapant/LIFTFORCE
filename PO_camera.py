@@ -23,7 +23,6 @@ class LicensePlateOCR:
     def preprocess_image(self, img):
         if img is None or img.size == 0: return None
         try:
-            # Уменьшаем коэффициент увеличения до 2, чтобы ускорить работу (было 3)
             img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
             return img
         except Exception:
@@ -84,11 +83,10 @@ class LicensePlateOCR:
 class PlateObserver:
     def __init__(self, confidence_threshold=2):
         self.history = {}
-        self.confirmed = {}  # {track_id: "A123AA"}
+        self.confirmed = {}
         self.THRESHOLD = confidence_threshold
 
     def add_reading(self, track_id, text):
-        # Если этот ID уже подтвержден - ничего не делаем
         if track_id in self.confirmed:
             return None
 
@@ -97,7 +95,6 @@ class PlateObserver:
 
         self.history[track_id].append(text)
 
-        # Храним только последние 10 чтений
         if len(self.history[track_id]) > 10:
             self.history[track_id].pop(0)
 
@@ -120,10 +117,18 @@ class PlateObserver:
 # MAIN
 # ==========================================
 def main():
-    print("🚀 Запуск с ROI и Глобальной паузой...")
+    print("🚀 Запуск без сохранения видео...")
 
-    VIDEO_SOURCE = 'test_video_6.mp4'
+    VIDEO_SOURCE = 'test_video_7.mp4'
     YOLO_MODEL = 'best.pt'
+
+    # --- НАСТРОЙКИ ФИЛЬТРАЦИИ ---
+    MIN_PLATE_WIDTH = 30
+
+    # --- НАСТРОЙКИ ЗОНЫ (В процентах от экрана) ---
+    ROI_TOP_CUT = 0.40  # Отрезать верхние 40%
+    ROI_LEFT_CUT = 0.15  # Отрезать левые 15%
+    ROI_RIGHT_CUT = 0.15  # Отрезать правые 15%
 
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
@@ -139,10 +144,8 @@ def main():
         return
 
     frame_count = 0
-    SKIP_FRAMES = 4  # Пропускаем больше кадров для скорости
-
-    # Глобальная переменная времени, до которого система "спит" после открытия ворот
-    system_cooldown_until = 0
+    SKIP_FRAMES = 2
+    system_cooldown_until = 5
 
     while True:
         ret, frame = cap.read()
@@ -153,21 +156,24 @@ def main():
         frame_count += 1
         h_full, w_full, _ = frame.shape
 
-        # --- ОПТИМИЗАЦИЯ 1: ROI (Область интереса) ---
-        # Мы отрезаем верхние 40% кадра. YOLO будет смотреть только вниз.
-        # Это ускоряет работу и убирает ложные срабатывания.
-        roi_y_start = int(h_full * 0.40)
-        roi_frame = frame[roi_y_start:, :]
+        # --- ВЫЧИСЛЯЕМ КООРДИНАТЫ ЗОНЫ ---
+        roi_y_start = int(h_full * ROI_TOP_CUT)
+        roi_x_start = int(w_full * ROI_LEFT_CUT)
+        roi_x_end = int(w_full * (1 - ROI_RIGHT_CUT))
 
-        # Трекинг запускаем на ROI
+        # Вырезаем зону
+        roi_frame = frame[roi_y_start:, roi_x_start:roi_x_end]
+
+        # Трекинг
         results = detector.track(roi_frame, persist=True, verbose=False, conf=0.3, tracker="bytetrack.yaml")
 
-        # Отрисовка линии зоны ROI (для наглядности)
-        cv2.line(frame, (0, roi_y_start), (w_full, roi_y_start), (0, 255, 255), 2)
-        cv2.putText(frame, "ROI AREA (Detection Zone)", (10, roi_y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 255, 255), 1)
+        # Отрисовка линий зоны
+        cv2.line(frame, (roi_x_start, roi_y_start), (roi_x_end, roi_y_start), (255, 0, 0), 2)
+        cv2.line(frame, (roi_x_start, roi_y_start), (roi_x_start, h_full), (255, 0, 0), 2)
+        cv2.line(frame, (roi_x_end, roi_y_start), (roi_x_end, h_full), (255, 0, 0), 2)
+        cv2.putText(frame, "ACTIVE ZONE", (roi_x_start + 10, roi_y_start + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 0, 0), 2)
 
-        # Проверка глобального кулдауна
         current_time = time.time()
         is_system_paused = current_time < system_cooldown_until
 
@@ -184,37 +190,35 @@ def main():
             track_ids = result.boxes.id.cpu().numpy().astype(int)
 
             for box, track_id in zip(boxes, track_ids):
-                # Координаты внутри ROI
                 roi_x1, roi_y1, roi_x2, roi_y2 = box
 
-                # --- ПЕРЕСЧЕТ КООРДИНАТ НА ПОЛНЫЙ КАДР ---
-                # Нам нужно вернуть Y координату на место (добавить смещение)
-                x1, x2 = roi_x1, roi_x2
+                # Пересчет координат
+                x1 = roi_x1 + roi_x_start
+                x2 = roi_x2 + roi_x_start
                 y1 = roi_y1 + roi_y_start
                 y2 = roi_y2 + roi_y_start
 
-                # Отрисовка рамки
-                color = (0, 255, 255)  # Желтый (поиск)
+                box_width = x2 - x1
 
-                # --- ОПТИМИЗАЦИЯ 2: ПРОВЕРКА ПОДТВЕРЖДЕНИЯ ---
-                # Если этот ID уже подтвержден - мы ВООБЩЕ не запускаем OCR
+                if box_width < MIN_PLATE_WIDTH:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
+                    continue
+
+                color = (0, 255, 255)  # Желтый
+
                 if track_id in observer.confirmed:
                     final_text = observer.confirmed[track_id]
                     color = (0, 255, 0)  # Зеленый
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, f"ID:{track_id} {final_text} (OPEN)", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                    continue  # <-- ВАЖНО: Сразу переходим к следующей машине
+                    continue
 
-                # Если система на паузе (ворота открыты) - не распознаем новых
                 if is_system_paused:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     continue
 
-                # Запуск OCR (только если не подтверждено и не пауза)
                 if frame_count % SKIP_FRAMES == 0:
-                    # Вырезаем из ПОЛНОГО кадра (так надежнее)
-                    # Добавляем отступы
                     pad = 10
                     crop_x1 = max(0, x1 - pad)
                     crop_y1 = max(0, y1 - pad)
@@ -223,31 +227,27 @@ def main():
 
                     plate_img = frame[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                    # Замер времени
-                    t1 = time.time()
                     text = ocr_reader.recognize(plate_img)
-                    dt = (time.time() - t1) * 1000
 
                     if text:
-                        print(f"✅ Чтение: {text} ({dt:.0f} ms)")
+                        print(f"✅ Чтение: {text}")
                         winner = observer.add_reading(track_id, text)
 
-                        # --- ОПТИМИЗАЦИЯ 3: ГЛОБАЛЬНАЯ ПАУЗА ---
                         if winner:
                             print(f"🔥🔥🔥 ВОРОТА ОТКРЫТЫ ДЛЯ: {winner}")
-                            # Ставим паузу на 5 секунд
                             system_cooldown_until = time.time() + 5.0
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, f"ID:{track_id} Analyzing...", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        cv2.imshow('Optimized Gate System', frame)
+        cv2.imshow('Smart Checkpoint', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+    print("🏁 Работа завершена.")
 
 
 if __name__ == '__main__':
